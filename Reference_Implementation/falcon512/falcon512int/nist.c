@@ -268,3 +268,207 @@ crypto_sign_open(unsigned char *m, unsigned long long *mlen,
 	*mlen = msg_len;
 	return 0;
 }
+
+int
+crypto_sign_signature_with_key(unsigned char* sm, unsigned long long* smlen,
+	const unsigned char* m, unsigned long long mlen,
+	const unsigned char* sk)
+{
+	TEMPALLOC union {
+		uint8_t b[72 * 512];
+		uint64_t dummy_u64;
+		fpr dummy_fpr;
+	} tmp;
+	TEMPALLOC int8_t f[512], g[512], F[512], G[512];
+	uint16_t h[512];
+	TEMPALLOC union {
+		int16_t sig[512];
+		uint16_t hm[512];
+	} r;
+	TEMPALLOC unsigned char seed[48], nonce[NONCELEN];
+
+	TEMPALLOC unsigned char esig[CRYPTO_BYTES - 2 - sizeof nonce];
+
+	TEMPALLOC inner_shake256_context sc;
+	size_t u, v, sig_len, w, n;
+
+	/*
+	 * Decode the private key.
+	 */
+	if (sk[0] != 0x50 + 9) {
+		return -1;
+	}
+	u = 1;
+	v = Zf(trim_i8_decode)(f, 9, Zf(max_fg_bits)[9],
+		sk + u, CRYPTO_SECRETKEYBYTES - u);
+	if (v == 0) {
+		return -2;
+	}
+	u += v;
+	v = Zf(trim_i8_decode)(g, 9, Zf(max_fg_bits)[9],
+		sk + u, CRYPTO_SECRETKEYBYTES - u);
+	if (v == 0) {
+		return -3;
+	}
+	u += v;
+	v = Zf(trim_i8_decode)(F, 9, Zf(max_FG_bits)[9],
+		sk + u, CRYPTO_SECRETKEYBYTES - u);
+	if (v == 0) {
+		return -4;
+	}
+	u += v;
+	if (u != CRYPTO_SECRETKEYBYTES) {
+		return -5;
+	}
+	if (!Zf(complete_private)(G, f, g, F, 9, tmp.b)) {
+		return -6;
+	}
+
+	uint16_t* h2, * tmp2;
+	uint8_t temp_b[FALCON_KEYGEN_TEMP_9];
+
+	for (;;) {
+		/*
+		 * Compute public key h = g/f mod X^N+1 mod q. If this
+		 * fails, we must restart.
+		 */
+		n = (size_t)1 << 9;
+		if (h == NULL) {
+			h2 = (uint16_t*)temp_b;
+			tmp2 = h2 + n;
+		}
+		else {
+			h2 = h;
+			tmp2 = (uint16_t*)temp_b;
+		}
+		if (!Zf(compute_public)(h2, f, g, 9, (uint8_t*)tmp2)) {
+			continue;
+		}
+		break;
+	}
+
+	/*
+	 * Create a random nonce (40 bytes).
+	 */
+	randombytes(nonce, sizeof nonce);
+
+	/*
+	 * Hash message nonce + message into a vector.
+	 */
+	inner_shake256_init(&sc);
+	inner_shake256_inject(&sc, nonce, sizeof nonce);
+	inner_shake256_inject(&sc, m, mlen);
+	inner_shake256_flip(&sc);
+	Zf(hash_to_point_vartime)(&sc, r.hm, 9);
+
+	/*
+	 * Initialize a RNG.
+	 */
+	randombytes(seed, sizeof seed);
+	inner_shake256_init(&sc);
+	inner_shake256_inject(&sc, seed, sizeof seed);
+	inner_shake256_flip(&sc);
+
+
+	/*
+	 * Compute the signature.
+	 */
+	Zf(sign_dyn)(r.sig, &sc, f, g, F, G, r.hm, 9, tmp.b);
+
+
+	/*
+	 * Encode the signature and bundle it with the message. Format is:
+	 *   signature length     2 bytes, big-endian
+	 *   nonce                40 bytes
+	 *   message              mlen bytes
+	 *   signature            slen bytes
+	 */
+	 /*
+	  * Compute and return the signature. This loops until a signature
+	  * value is found that fits in the provided buffer.
+	  */
+
+	esig[0] = 0x30 + 9;
+	sig_len = Zf(comp_encode)(esig + 1, (sizeof esig) - 1, r.sig, 9);
+	if (sig_len == 0) {
+		return -7;
+	}
+
+	sm[0] = esig[0];
+	memcpy(sm + 1, nonce, sizeof nonce);
+	memcpy(sm + 1 + (sizeof nonce), esig + 1, sig_len);
+
+	//public key
+	sm[1 + (sizeof nonce) + sig_len] = 0x00 + 9;
+	w = Zf(modq_encode)(
+		sm + 1 + (sizeof nonce) + sig_len + 1, CRYPTO_PUBLICKEYBYTES - 1, h, 9);
+	if (w != CRYPTO_PUBLICKEYBYTES - 1) {
+		return w;
+	}
+	sig_len = sig_len + w + 1;
+
+	*smlen = sig_len + 1 + (sizeof nonce);
+
+	return 0;
+}
+
+int
+crypto_sign_verify(unsigned char* m, unsigned long long* mlen,
+	const unsigned char* sm, unsigned long long smlen,
+	const unsigned char* pk)
+{
+	TEMPALLOC union {
+		uint8_t b[2 * 512];
+		uint64_t dummy_u64;
+		fpr dummy_fpr;
+	} tmp;
+	const unsigned char* esig;
+	TEMPALLOC uint16_t h[512], hm[512];
+	TEMPALLOC int16_t sig[512];
+	TEMPALLOC inner_shake256_context sc;
+	size_t sig_len, msg_len;
+
+	/*
+	 * Decode public key.
+	 */
+	if (pk[0] != 0x00 + 9) {
+		return -1;
+	}
+	if (Zf(modq_decode)(h, 9, pk + 1, CRYPTO_PUBLICKEYBYTES - 1)
+		!= CRYPTO_PUBLICKEYBYTES - 1)
+	{
+		return -2;
+	}
+	Zf(to_ntt_monty)(h, 9);
+
+	/*
+	* Decode signature.
+	*/
+	if (smlen == 0) {
+		return -3;
+	}
+	if (Zf(comp_decode)(sig, 9, sm + 1 + NONCELEN, (smlen - 1 - NONCELEN)) != (smlen - 1 - NONCELEN)) {
+		return -4;
+	}
+
+	/*
+	 * Hash nonce + message into a vector.
+	 */
+	inner_shake256_init(&sc);
+	inner_shake256_inject(&sc, sm + 1, NONCELEN);
+	inner_shake256_inject(&sc, m, mlen);
+	inner_shake256_flip(&sc);
+	Zf(hash_to_point_vartime)(&sc, hm, 9);
+
+	/*
+	 * Verify signature.
+	 */
+	if (!Zf(verify_raw)(hm, sig, h, 9, tmp.b)) {
+		return -5;
+	}
+
+	/*
+	 * Return.
+	 */
+	return 0;
+}
